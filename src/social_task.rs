@@ -608,24 +608,39 @@ impl SocialAutomation {
     async fn click_instagram_follow(&self) -> Result<()> {
         let wid = self.worker_id;
 
-        let find_script = r#"
+        let find_and_click_script = r#"
         (() => {
-            const candidates = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'));
+            const candidates = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"], a[role="button"]'));
 
+            // 1. Cek apakah sudah di-follow
             const alreadyFollowed = candidates.find(el => {
-                const text = (el.innerText || '').trim().toLowerCase();
-                return text === 'following' || text === 'requested';
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                return text === 'following' || text === 'requested' || 
+                       text === 'mengikuti' || text === 'diminta' ||
+                       text.includes('following') || text.includes('mengikuti');
             });
             if (alreadyFollowed) {
                 return { action: "already_followed", text: alreadyFollowed.innerText.trim() };
             }
 
+            // 2. Cari tombol Follow dengan selector teks fleksibel (Inggris & Indonesia)
             const followBtn = candidates.find(el => {
-                const text = (el.innerText || '').trim().toLowerCase();
-                return text === 'follow';
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                return text === 'follow' || text === 'follow back' || 
+                       text === 'ikuti' || text === 'ikuti balik' ||
+                       text === 'follow back?' || text === 'ikuti kembali';
+            }) || candidates.find(el => {
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                const isExclude = text.includes('message') || text.includes('pesan') || 
+                                  text.includes('share') || text.includes('bagikan') ||
+                                  text.includes('contact') || text.includes('kontak') ||
+                                  text.includes('edit');
+                return !isExclude && (text.startsWith('follow') || text.startsWith('ikuti'));
             });
+
             if (followBtn) {
-                followBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                // Gunakan 'instant' agar koordinat rect langsung tepat tanpa delay animasi smooth
+                followBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
                 const rect = followBtn.getBoundingClientRect();
                 return {
                     action: "found",
@@ -638,47 +653,87 @@ impl SocialAutomation {
         })()
         "#;
 
-        if !self.fast_mode {
-            let settle = rand::rng().random_range(400..=900_u64);
-            tokio::time::sleep(Duration::from_millis(settle)).await;
-        }
+        println!("[Worker #{wid}] [Instagram] Mencari tombol Follow...");
+        let max_attempts = if self.fast_mode { 12 } else { 18 };
 
-        let res = self.ig_browser.evaluate(find_script).await?;
-        let action = res.get("action").and_then(Value::as_str).unwrap_or("not_found");
+        for _attempt in 1..=max_attempts {
+            let res = self.ig_browser.evaluate(find_and_click_script).await?;
+            let action = res.get("action").and_then(Value::as_str).unwrap_or("not_found");
 
-        match action {
-            "already_followed" => {
-                println!("[Worker #{wid}] [Instagram] Sudah di-follow (Following/Requested). Skip.");
-            }
-            "found" => {
-                if let Some(rect) = res.get("rect") {
-                    let rx = rect["x"].as_f64().unwrap_or(0.0);
-                    let ry = rect["y"].as_f64().unwrap_or(0.0);
-                    let rw = rect["width"].as_f64().unwrap_or(80.0);
-                    let rh = rect["height"].as_f64().unwrap_or(30.0);
+            match action {
+                "already_followed" => {
+                    let text = res.get("text").and_then(Value::as_str).unwrap_or("Following");
+                    println!("[Worker #{wid}] [Instagram] Akun sudah di-follow ({text}). Skip.");
+                    return Ok(());
+                }
+                "found" => {
+                    let btn_text = res.get("text").and_then(Value::as_str).unwrap_or("Follow");
+                    if let Some(rect) = res.get("rect") {
+                        let rx = rect["x"].as_f64().unwrap_or(0.0);
+                        let ry = rect["y"].as_f64().unwrap_or(0.0);
+                        let rw = rect["width"].as_f64().unwrap_or(80.0);
+                        let rh = rect["height"].as_f64().unwrap_or(30.0);
 
-                    if self.fast_mode {
-                        println!("[Worker #{wid}] [Instagram] Follow button ditemukan. Klik via Fast Hardware CDP...");
+                        println!("[Worker #{wid}] [Instagram] Tombol '{btn_text}' ditemukan pada koordinat ({:.0}, {:.0}). Mengklik via Hardware CDP...", rx, ry);
                         input::fast_cdp_click(&self.ig_browser, rx, ry, rw, rh).await?;
-                        println!("[Worker #{wid}] [Instagram] Follow diklik (Hardware CDP)!");
+                        println!("[Worker #{wid}] [Instagram] Tombol '{btn_text}' berhasil diklik!");
                     } else {
-                        println!("[Worker #{wid}] [Instagram] Follow button ditemukan. Klik dengan human-like mouse...");
-                        input::human_click(&self.ig_browser, rx, ry, rw, rh).await?;
-                        println!("[Worker #{wid}] [Instagram] Follow diklik!");
+                        // Fallback JS click langsung jika rect tidak terbaca
+                        self.ig_browser.evaluate(r#"
+                            (() => {
+                                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                                const b = btns.find(el => {
+                                    const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                    return t === 'follow' || t === 'follow back' || t === 'ikuti' || t === 'ikuti balik';
+                                });
+                                if (b) b.click();
+                            })()
+                        "#).await?;
+                        println!("[Worker #{wid}] [Instagram] Tombol '{btn_text}' diklik (fallback JS)!");
                     }
-                } else {
-                    println!("[Worker #{wid}] [Instagram] Follow button ditemukan. Klik via Hardware CDP...");
-                    input::click(&self.ig_browser, 500.0, 200.0, 1).await?;
+
+                    // Verifikasi apakah tombol berubah status (Following / Requested / Mengikuti)
+                    tokio::time::sleep(Duration::from_millis(if self.fast_mode { 600 } else { 1200 })).await;
+                    let verify_script = r#"
+                    (() => {
+                        const btns = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'));
+                        return btns.some(el => {
+                            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            return t === 'following' || t === 'requested' || t === 'mengikuti' || t === 'diminta';
+                        });
+                    })()
+                    "#;
+                    if let Ok(verified) = self.ig_browser.evaluate(verify_script).await {
+                        if verified.as_bool() == Some(true) {
+                            println!("[Worker #{wid}] ✅ [Instagram] Terverifikasi: Status akun berubah menjadi 'Following'!");
+                            return Ok(());
+                        } else {
+                            // Coba cadangan klik langsung jika status belum berubah
+                            let _ = self.ig_browser.evaluate(r#"
+                                (() => {
+                                    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                                    const b = btns.find(el => {
+                                        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                        return t === 'follow' || t === 'follow back' || t === 'ikuti' || t === 'ikuti balik';
+                                    });
+                                    if (b) b.click();
+                                })()
+                            "#).await;
+                            println!("[Worker #{wid}] 🔄 [Instagram] Mencoba klik cadangan untuk memastikan tombol tertekan...");
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            return Ok(());
+                        }
+                    }
+
+                    return Ok(());
+                }
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(if self.fast_mode { 250 } else { 500 })).await;
                 }
             }
-            _ => {
-                println!("[Worker #{wid}] [Instagram] Tombol Follow tidak ditemukan.");
-            }
         }
 
-        let post_wait = if self.fast_mode { 200 } else { rand::rng().random_range(2000..=5000_u64) };
-        tokio::time::sleep(Duration::from_millis(post_wait)).await;
-
+        eprintln!("[Worker #{wid}] ⚠️ [Instagram] Tombol Follow tidak ditemukan setelah {} percobaan.", max_attempts);
         Ok(())
     }
 
