@@ -1,0 +1,26 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Logs & monitoring data (protects session history & user data)
+logs/
+*.log
+*.jsonl
+
+# Chrome profiles (protects local login sessions, cookies, tokens)
+.browser-automation-profile*
+profiles/
+
+# Environment variables & secrets
+.env
+*.env
+credentials.json
+
+# Editor & OS artifacts
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.tmp
+*.bak
